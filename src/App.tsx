@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react"
 import Moment from "moment"
 import Papa from "papaparse"
+import {
+  fetchLcscPart,
+  isValidLcscId,
+  lcscProductUrl,
+  normalizeLcscId,
+  priceForQuantity,
+  type LcscPart,
+} from "./lcsc"
 
 type RowData = {
   lcscId: string
@@ -34,6 +42,8 @@ type AggregatedRow = RowData & {
 const STORAGE_KEY = "lcsc-inventory-data"
 const FILENAME_KEY = "lcsc-inventory-filename"
 
+const MENU_ITEM = "block w-full px-4 py-2 text-left text-sm text-gray-200 hover:bg-gray-700"
+
 export default function InventoryApp() {
   const [data, setData] = useState<AggregatedRow[]>([])
   const [fileName, setFileName] = useState<string>("inventory.csv")
@@ -47,6 +57,17 @@ export default function InventoryApp() {
   const [saveIndicator, setSaveIndicator] = useState<string>("")
   const [hasUnappliedChanges, setHasUnappliedChanges] = useState<boolean>(false)
   const [isModifiedFromStorage, setIsModifiedFromStorage] = useState<boolean>(false)
+
+  // "Add by LCSC ID" dialog
+  const [showMenu, setShowMenu] = useState<boolean>(false)
+  const [showAddPart, setShowAddPart] = useState<boolean>(false)
+  const [lcscQuery, setLcscQuery] = useState<string>("")
+  const [isLookingUp, setIsLookingUp] = useState<boolean>(false)
+  const [lookupError, setLookupError] = useState<string>("")
+  const [lcscPart, setLcscPart] = useState<LcscPart | null>(null)
+  const [addQuantity, setAddQuantity] = useState<string>("1")
+  const [addUnitPrice, setAddUnitPrice] = useState<string>("0")
+  const [isPriceEdited, setIsPriceEdited] = useState<boolean>(false)
 
   useEffect(() => {
     loadFromStorage()
@@ -78,6 +99,11 @@ export default function InventoryApp() {
 
     setBomErrorInfo(allErrors)
   }, [multiplier, data, missingBomComp])
+
+  const runFromMenu = (action: () => void) => {
+    setShowMenu(false)
+    action()
+  }
 
   const loadFromStorage = () => {
     try {
@@ -210,13 +236,20 @@ export default function InventoryApp() {
       header: true,
       skipEmptyLines: true,
       complete: (results) => {
-        if (isBOMFile && data.length > 0) {
+        if (isBOMFile) {
+          // Without inventory there is nothing to match against, and the rows
+          // would otherwise fall through and be parsed as an inventory CSV.
+          if (data.length === 0) {
+            alert("Import your inventory CSV first.\n\nA BOM is matched against parts already in inventory.")
+            return
+          }
+
           const BOMdata = results.data.map(transformBOM)
           const newData = data.map((item) => ({ ...item }))
           const newMissingComponents: BOMErrorInfo[] = []
 
           for (let i = 0; i < BOMdata.length; i++) {
-            let index = newData.findIndex((d) => d.lcscId === BOMdata[i].lcscId)
+            const index = newData.findIndex((d) => d.lcscId === BOMdata[i].lcscId)
             if (index === -1) {
               newMissingComponents.push({
                 lcscId: BOMdata[i].lcscId,
@@ -362,6 +395,109 @@ export default function InventoryApp() {
     }
   }
 
+  const openAddPart = () => {
+    setShowAddPart(true)
+    setLcscQuery("")
+    setLookupError("")
+    setLcscPart(null)
+    setAddQuantity("1")
+    setAddUnitPrice("0")
+    setIsPriceEdited(false)
+  }
+
+  const lookupLcscPart = async () => {
+    const lcscId = normalizeLcscId(lcscQuery)
+
+    if (!isValidLcscId(lcscId)) {
+      setLookupError("Enter an LCSC part number like C14663")
+      return
+    }
+
+    setIsLookingUp(true)
+    setLookupError("")
+    setLcscPart(null)
+
+    try {
+      const part = await fetchLcscPart(lcscId)
+      const quantity = parseInt(addQuantity) || 1
+
+      setLcscPart(part)
+      setLcscQuery(part.lcscId)
+      setAddUnitPrice(priceForQuantity(part.priceTiers, quantity).toFixed(4))
+      setIsPriceEdited(false)
+    } catch (error) {
+      setLookupError(error instanceof Error ? error.message : "LCSC lookup failed")
+    } finally {
+      setIsLookingUp(false)
+    }
+  }
+
+  const handleAddQuantityChange = (value: string) => {
+    setAddQuantity(value)
+
+    // Keep the unit price on the matching LCSC price break until it's overridden.
+    if (lcscPart && !isPriceEdited) {
+      setAddUnitPrice(priceForQuantity(lcscPart.priceTiers, parseInt(value) || 0).toFixed(4))
+    }
+  }
+
+  const addLcscPartToInventory = () => {
+    if (!lcscPart) return
+
+    const quantity = parseInt(addQuantity) || 0
+    const unitPrice = parseFloat(addUnitPrice) || 0
+
+    if (quantity <= 0) {
+      setLookupError("Quantity must be at least 1")
+      return
+    }
+
+    const existingIndex = data.findIndex((d) => d.lcscId === lcscPart.lcscId)
+    const newData = [...data]
+
+    if (existingIndex === -1) {
+      newData.push({
+        lcscId: lcscPart.lcscId,
+        manufactureId: lcscPart.manufactureId,
+        manufacturer: lcscPart.manufacturer,
+        package: lcscPart.package,
+        description: lcscPart.description,
+        quantity,
+        unitPrice,
+        priceHistory: [{ quantity, unitPrice }],
+        totalCost: quantity * unitPrice,
+        editedQuantity: 0,
+      })
+    } else {
+      const existing = newData[existingIndex]
+      const totalQuantity = existing.quantity + quantity
+      const totalCost = existing.totalCost + quantity * unitPrice
+
+      newData[existingIndex] = {
+        ...existing,
+        manufactureId: existing.manufactureId || lcscPart.manufactureId,
+        manufacturer: existing.manufacturer || lcscPart.manufacturer,
+        package: existing.package || lcscPart.package,
+        description: existing.description || lcscPart.description,
+        quantity: totalQuantity,
+        unitPrice: totalQuantity > 0 ? totalCost / totalQuantity : unitPrice,
+        totalCost,
+        priceHistory: [...existing.priceHistory, { quantity, unitPrice }],
+      }
+    }
+
+    setData(newData)
+    setIsModifiedFromStorage(false)
+    saveToStorage(newData)
+    setShowAddPart(false)
+
+    alert(
+      existingIndex === -1
+        ? `Added ${lcscPart.lcscId} (${quantity} pcs) to inventory.`
+        : `Added ${quantity} pcs to existing ${lcscPart.lcscId}.\nNew quantity: ${newData[existingIndex].quantity}.`
+    )
+  }
+
   const clearBOM = () => {
     if (window.confirm("Clear BOM usage data?")) {
       const newData = data.map((row) => ({
@@ -408,6 +544,21 @@ export default function InventoryApp() {
     setTimeout(() => setSaveIndicator(""), 3000)
 
     alert("BOM usage applied! Quantities updated in working copy.\n\nOriginal inventory is safe in localStorage.\nReload page to restore original.")
+  }
+
+  const deleteRow = (lcscId: string) => {
+    const row = data.find((d) => d.lcscId === lcscId)
+    if (!row) return
+
+    const label = row.manufactureId ? `${lcscId} (${row.manufactureId})` : lcscId
+    if (!window.confirm(`Remove ${label} from inventory?`)) return
+
+    const newData = data.filter((d) => d.lcscId !== lcscId)
+    setData(newData)
+
+    if (!isModifiedFromStorage) {
+      saveToStorage(newData)
+    }
   }
 
   const handleQuantityChange = (index: number, value: string) => {
@@ -485,28 +636,16 @@ export default function InventoryApp() {
         <h1 className="text-2xl font-bold mb-3 text-center text-gray-100">LCSC Inventory Manager</h1>
         <div className="flex flex-wrap gap-2 justify-center">
           <button
-            onClick={() => pickAndLoadCSV(false, false)}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+            onClick={openAddPart}
+            className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700"
           >
-            Import CSV
-          </button>
-          <button
-            onClick={() => pickAndLoadCSV(true, false)}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-          >
-            Combine CSV
+            + Add Manually
           </button>
           <button
             onClick={() => pickAndLoadCSV(false, true)}
             className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
           >
-            Load BOM
-          </button>
-          <button
-            onClick={() => pickAndLoadCSV(true, true)}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-          >
-            Combine BOM
+            Import BOM
           </button>
           <button
             onClick={exportToCSV}
@@ -514,36 +653,66 @@ export default function InventoryApp() {
           >
             Export CSV
           </button>
-          <button
-            onClick={applyBOM}
-            className={`px-4 py-2 rounded font-bold ${hasUnappliedChanges
-                ? "bg-yellow-500 text-white hover:bg-yellow-600"
-                : "bg-gray-700 text-gray-500 cursor-not-allowed"
-              }`}
-            disabled={!hasUnappliedChanges}
-          >
-            Apply BOM ✓
-          </button>
-          {isModifiedFromStorage && (
+
+          {/* Everything else lives in the burger menu */}
+          <div className="relative">
             <button
-              onClick={reloadOriginal}
-              className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+              onClick={() => setShowMenu(!showMenu)}
+              aria-label="More actions"
+              aria-expanded={showMenu}
+              className={`px-4 py-2 rounded border border-gray-600 text-gray-100 ${showMenu ? "bg-gray-600" : "bg-gray-700 hover:bg-gray-600"
+                }`}
             >
-              Reload Original
+              ☰
             </button>
-          )}
-          <button
-            onClick={clearBOM}
-            className="px-4 py-2 bg-orange-500 text-white rounded hover:bg-orange-600"
-          >
-            Clear BOM
-          </button>
-          <button
-            onClick={clearStorage}
-            className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
-          >
-            Clear All
-          </button>
+
+            {showMenu && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowMenu(false)} />
+                <div className="absolute right-0 z-50 mt-2 w-60 overflow-hidden rounded-lg border border-gray-600 bg-gray-800 shadow-xl">
+                  <p className="px-4 pt-3 pb-1 text-xs font-bold uppercase tracking-wide text-gray-400">
+                    Inventory
+                  </p>
+                  <button onClick={() => runFromMenu(() => pickAndLoadCSV(false, false))} className={MENU_ITEM}>
+                    Import CSV
+                  </button>
+                  <button onClick={() => runFromMenu(() => pickAndLoadCSV(true, false))} className={MENU_ITEM}>
+                    Combine CSV
+                  </button>
+
+                  <p className="border-t border-gray-700 px-4 pt-3 pb-1 text-xs font-bold uppercase tracking-wide text-gray-400">
+                    BOM
+                  </p>
+                  <button onClick={() => runFromMenu(() => pickAndLoadCSV(true, true))} className={MENU_ITEM}>
+                    Combine BOM
+                  </button>
+                  <button
+                    onClick={() => runFromMenu(applyBOM)}
+                    disabled={!hasUnappliedChanges}
+                    className={`${MENU_ITEM} font-bold ${hasUnappliedChanges ? "text-yellow-400" : "cursor-not-allowed text-gray-500 hover:bg-transparent"
+                      }`}
+                  >
+                    Apply BOM ✓
+                  </button>
+                  <button onClick={() => runFromMenu(clearBOM)} className={`${MENU_ITEM} text-orange-400`}>
+                    Clear BOM
+                  </button>
+
+                  <p className="border-t border-gray-700 px-4 pt-3 pb-1 text-xs font-bold uppercase tracking-wide text-gray-400">
+                    Data
+                  </p>
+                  {isModifiedFromStorage && (
+                    <button onClick={() => runFromMenu(reloadOriginal)} className={MENU_ITEM}>
+                      Reload Original
+                    </button>
+                  )}
+                  <button onClick={() => runFromMenu(clearStorage)} className={`${MENU_ITEM} text-red-400`}>
+                    Clear All
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </div>
 
@@ -669,9 +838,12 @@ export default function InventoryApp() {
                 </div>
                 <div
                   onClick={() => handleSort("description")}
-                  className="w-[610px] p-3 font-bold text-xs text-gray-200 cursor-pointer hover:bg-gray-700"
+                  className="w-[610px] p-3 font-bold text-xs text-gray-200 cursor-pointer hover:bg-gray-700 border-r border-gray-700"
                 >
                   Description {sortField === "description" && (sortAsc ? "▲" : "▼")}
+                </div>
+                <div className="w-[70px] p-3 font-bold text-xs text-gray-200 text-center">
+                  Delete
                 </div>
               </div>
 
@@ -689,8 +861,16 @@ export default function InventoryApp() {
                         key={row.lcscId}
                         className={`flex border-b border-gray-700 min-h-[48px] ${i % 2 === 0 ? "bg-gray-800" : "bg-gray-900"}`}
                       >
-                        <div className="w-[100px] p-3 text-xs text-gray-300 border-r border-gray-700 flex items-center">
-                          {row.lcscId}
+                        <div className="w-[100px] p-3 text-xs border-r border-gray-700 flex items-center">
+                          <a
+                            href={lcscProductUrl(row.lcscId)}
+                            target="_blank"
+                            rel="noreferrer"
+                            title={`Open ${row.lcscId} on lcsc.com`}
+                            className="text-blue-400 underline hover:text-blue-300"
+                          >
+                            {row.lcscId}
+                          </a>
                         </div>
                         <div className="w-[120px] p-3 text-xs text-gray-300 border-r border-gray-700 flex items-center">
                           {row.manufacturer}
@@ -731,8 +911,17 @@ export default function InventoryApp() {
                         >
                           ${remainingCost.toFixed(2)}
                         </div>
-                        <div className="w-[610px] p-3 text-xs text-gray-300 flex items-center line-clamp-2">
+                        <div className="w-[610px] p-3 text-xs text-gray-300 border-r border-gray-700 flex items-center line-clamp-2">
                           {row.description}
+                        </div>
+                        <div className="w-[70px] p-3 flex items-center justify-center">
+                          <button
+                            onClick={() => deleteRow(row.lcscId)}
+                            title={`Remove ${row.lcscId} from inventory`}
+                            className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-900 hover:text-red-200"
+                          >
+                            ✕
+                          </button>
                         </div>
                       </div>
                     )
@@ -751,7 +940,166 @@ export default function InventoryApp() {
       {data.length === 0 && !isLoading && (
         <div className="flex-1 flex flex-col items-center justify-center p-10">
           <p className="text-lg font-bold text-gray-200 mb-2">No inventory data</p>
-          <p className="text-sm text-gray-400">Import a CSV file to get started</p>
+          <p className="text-sm text-gray-400">Import a CSV file or add a part by LCSC ID to get started</p>
+        </div>
+      )}
+
+      {showAddPart && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center overflow-auto bg-black/70 p-4 py-10"
+          onClick={() => setShowAddPart(false)}
+        >
+          <div
+            className="w-full max-w-2xl rounded-lg border border-gray-700 bg-gray-800 p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-lg font-bold text-gray-100">Add Part by LCSC ID</h2>
+              <button
+                onClick={() => setShowAddPart(false)}
+                className="px-2 text-gray-400 hover:text-gray-200"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={lcscQuery}
+                onChange={(e) => setLcscQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && lookupLcscPart()}
+                placeholder="e.g. C14663"
+                autoFocus
+                className="h-10 flex-1 rounded-lg border border-gray-600 bg-gray-700 px-3 text-sm text-gray-100 placeholder-gray-400"
+              />
+              <button
+                onClick={lookupLcscPart}
+                disabled={isLookingUp}
+                className={`h-10 rounded px-4 text-white ${isLookingUp ? "bg-gray-600 cursor-not-allowed" : "bg-blue-500 hover:bg-blue-600"
+                  }`}
+              >
+                {isLookingUp ? "Fetching..." : "Fetch"}
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-gray-400">
+              Details are fetched live from LCSC. Only quantity and unit price are yours to set.
+            </p>
+
+            {lookupError && (
+              <div className="mt-3 rounded bg-red-600 p-3 text-sm text-white">{lookupError}</div>
+            )}
+
+            {lcscPart && (
+              <>
+                <div className="mt-4 flex gap-4 rounded border border-gray-700 bg-gray-900 p-4">
+                  {lcscPart.imageUrl && (
+                    <img
+                      src={lcscPart.imageUrl}
+                      alt={lcscPart.lcscId}
+                      className="h-20 w-20 shrink-0 rounded bg-white object-contain"
+                    />
+                  )}
+                  <div className="min-w-0 flex-1 text-xs text-gray-300">
+                    <p className="mb-1 text-sm font-bold text-gray-100">
+                      {lcscPart.lcscId} — {lcscPart.manufactureId}
+                    </p>
+                    <p className="mb-1">
+                      {lcscPart.manufacturer}
+                      {lcscPart.package && ` · ${lcscPart.package}`}
+                    </p>
+                    <p className="mb-1">{lcscPart.description}</p>
+                    <p className="text-gray-400">
+                      LCSC stock: {lcscPart.stock.toLocaleString()} · min order: {lcscPart.minBuyNumber}
+                      {lcscPart.datasheetUrl && (
+                        <>
+                          {" · "}
+                          <a
+                            href={lcscPart.datasheetUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-blue-400 underline hover:text-blue-300"
+                          >
+                            datasheet
+                          </a>
+                        </>
+                      )}
+                    </p>
+                  </div>
+                </div>
+
+                {lcscPart.priceTiers.length > 0 && (
+                  <div className="mt-3">
+                    <p className="mb-1 text-xs font-bold text-gray-300">LCSC price breaks (USD)</p>
+                    <div className="flex flex-wrap gap-2">
+                      {lcscPart.priceTiers.map((tier) => (
+                        <span
+                          key={tier.quantity}
+                          className="rounded bg-gray-700 px-2 py-1 text-xs text-gray-200"
+                        >
+                          {tier.quantity}+ → ${tier.unitPrice.toFixed(4)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="mt-4 flex flex-wrap gap-4">
+                  <label className="text-xs text-gray-300">
+                    <span className="mb-1 block font-bold">Quantity</span>
+                    <input
+                      type="number"
+                      min="1"
+                      value={addQuantity}
+                      onChange={(e) => handleAddQuantityChange(e.target.value)}
+                      className="h-9 w-32 rounded border border-gray-600 bg-gray-700 px-2 text-sm text-gray-100"
+                    />
+                  </label>
+                  <label className="text-xs text-gray-300">
+                    <span className="mb-1 block font-bold">Unit Price ($)</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.0001"
+                      value={addUnitPrice}
+                      onChange={(e) => {
+                        setAddUnitPrice(e.target.value)
+                        setIsPriceEdited(true)
+                      }}
+                      className="h-9 w-32 rounded border border-gray-600 bg-gray-700 px-2 text-sm text-gray-100"
+                    />
+                  </label>
+                  <div className="text-xs text-gray-300">
+                    <span className="mb-1 block font-bold">Total</span>
+                    <p className="flex h-9 items-center font-bold text-gray-100">
+                      ${((parseInt(addQuantity) || 0) * (parseFloat(addUnitPrice) || 0)).toFixed(2)}
+                    </p>
+                  </div>
+                </div>
+
+                {data.some((row) => row.lcscId === lcscPart.lcscId) && (
+                  <p className="mt-3 text-xs text-orange-400">
+                    Already in inventory — this quantity will be added and the unit price averaged.
+                  </p>
+                )}
+
+                <div className="mt-5 flex justify-end gap-2">
+                  <button
+                    onClick={() => setShowAddPart(false)}
+                    className="rounded bg-gray-700 px-4 py-2 text-gray-200 hover:bg-gray-600"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={addLcscPartToInventory}
+                    className="rounded bg-green-600 px-4 py-2 font-bold text-white hover:bg-green-700"
+                  >
+                    Add to Inventory
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       )}
     </div>
