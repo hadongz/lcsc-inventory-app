@@ -642,16 +642,16 @@ export default function InventoryApp() {
             + Add Manually
           </button>
           <button
+            onClick={() => pickAndLoadCSV(false, false)}
+            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+          >
+            Import CSV
+          </button>
+          <button
             onClick={() => pickAndLoadCSV(false, true)}
             className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
           >
             Import BOM
-          </button>
-          <button
-            onClick={exportToCSV}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-          >
-            Export CSV
           </button>
 
           {/* Everything else lives in the burger menu */}
@@ -673,11 +673,11 @@ export default function InventoryApp() {
                   <p className="px-4 pt-3 pb-1 text-xs font-bold uppercase tracking-wide text-gray-400">
                     Inventory
                   </p>
-                  <button onClick={() => runFromMenu(() => pickAndLoadCSV(false, false))} className={MENU_ITEM}>
-                    Import CSV
-                  </button>
                   <button onClick={() => runFromMenu(() => pickAndLoadCSV(true, false))} className={MENU_ITEM}>
                     Combine CSV
+                  </button>
+                  <button onClick={() => runFromMenu(() => exportToCSV())} className={MENU_ITEM}>
+                    Export CSV
                   </button>
 
                   <p className="border-t border-gray-700 px-4 pt-3 pb-1 text-xs font-bold uppercase tracking-wide text-gray-400">
