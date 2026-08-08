@@ -162,23 +162,49 @@ export default function InventoryApp() {
     }
   }
 
+  // Column names vary by exporter — KiCad and EasyEDA write "LCSC Part #" and
+  // "Quantity", this app's own export writes "LCSC Part" and "Qty". Match on
+  // any of the known spellings, case-insensitively, and tolerate the UTF-8 BOM
+  // that lands on the first header of a KiCad/Excel export.
+  const pickColumn = (row: Record<string, unknown>, ...names: string[]): string => {
+    const normalize = (key: string) => key.replace(/^\uFEFF/, "").trim().toLowerCase()
+
+    for (const name of names) {
+      const key = Object.keys(row).find((k) => normalize(k) === name.toLowerCase())
+      if (key && row[key] != null && String(row[key]).trim() !== "") {
+        return String(row[key]).trim()
+      }
+    }
+    return ""
+  }
+
   const transformRow = (csvRow: any): RowData => {
     return {
-      lcscId: csvRow["LCSC Part Number"]?.trim() || "",
-      manufactureId: csvRow["Manufacture Part Number"]?.trim() || "",
-      manufacturer: csvRow["Manufacturer"]?.trim() || "",
-      package: csvRow["Package"]?.trim() || "",
-      quantity: parseInt(csvRow["Quantity"]) || 0,
-      description: csvRow["Description"]?.trim() || "",
-      unitPrice: parseFloat(csvRow["Unit Price($)"]) || 0,
+      lcscId: pickColumn(csvRow, "LCSC Part Number", "LCSC Part #", "LCSC Part", "LCSC"),
+      manufactureId: pickColumn(csvRow, "Manufacture Part Number", "Manufacturer Part Number", "MPN"),
+      manufacturer: pickColumn(csvRow, "Manufacturer", "Mfr"),
+      package: pickColumn(csvRow, "Package", "Footprint"),
+      quantity: parseInt(pickColumn(csvRow, "Quantity", "Qty")) || 0,
+      description: pickColumn(csvRow, "Description", "Value"),
+      unitPrice: parseFloat(pickColumn(csvRow, "Unit Price($)", "Unit Price")) || 0,
     }
   }
 
   const transformBOM = (row: any): BOMData => {
     return {
-      lcscId: row["LCSC Part"]?.trim() || "",
-      manufactureId: row["Manfufacture ID"]?.trim() || "",
-      quantity: parseInt(row["Qty"]) || 0,
+      lcscId: pickColumn(row, "LCSC Part", "LCSC Part #", "LCSC Part Number", "LCSC"),
+      // Only used to label warnings, so fall back to whatever names the line.
+      manufactureId: pickColumn(
+        row,
+        "Manfufacture ID",
+        "Manufacture ID",
+        "Manufacturer Part Number",
+        "Manufacture Part Number",
+        "Value",
+        "Comment",
+        "Designator"
+      ),
+      quantity: parseInt(pickColumn(row, "Qty", "Quantity")) || 0,
     }
   }
 
@@ -244,7 +270,36 @@ export default function InventoryApp() {
             return
           }
 
-          const BOMdata = results.data.map(transformBOM)
+          const allBOMrows = results.data.map(transformBOM)
+
+          // Lines with no LCSC part number are normal — test points, DNP parts,
+          // anything not sourced yet. Skip them instead of reporting each as a
+          // missing component, but say how many were skipped.
+          const usableRows = allBOMrows.filter((row) => row.lcscId !== "")
+          const skippedCount = allBOMrows.length - usableRows.length
+
+          // One part usually spans several designator lines (J4, "J5, J9", J6…
+          // are all the same 4P connector). Sum them up front — assigning line
+          // by line would let the last line overwrite the earlier ones.
+          const totalsByPart = new Map<string, BOMData>()
+          usableRows.forEach((row) => {
+            const existing = totalsByPart.get(row.lcscId)
+            if (existing) {
+              existing.quantity += row.quantity
+            } else {
+              totalsByPart.set(row.lcscId, { ...row })
+            }
+          })
+          const BOMdata = Array.from(totalsByPart.values())
+          const totalBomQuantity = BOMdata.reduce((sum, row) => sum + row.quantity, 0)
+
+          if (BOMdata.length === 0) {
+            alert(
+              `No LCSC part numbers found in this file.\n\nExpected a column named "LCSC Part", "LCSC Part #" or "LCSC Part Number", and a quantity column named "Qty" or "Quantity".`
+            )
+            return
+          }
+
           const newData = data.map((item) => ({ ...item }))
           const newMissingComponents: BOMErrorInfo[] = []
 
@@ -285,13 +340,13 @@ export default function InventoryApp() {
             setHasUnappliedChanges(true)
 
             alert(
-              `BOM Combined!\n\nAdded ${BOMdata.length} parts to existing BOM requirements.\n${newMissingComponents.length > 0 ? `\nWarning: ${newMissingComponents.length} parts not found in inventory` : ""}`
+              `BOM Combined!\n\nAdded ${usableRows.length} lines (${BOMdata.length} unique parts, ${totalBomQuantity} pcs) to existing BOM requirements.${skippedCount > 0 ? `\nSkipped ${skippedCount} lines with no LCSC part number.` : ""}${newMissingComponents.length > 0 ? `\n\nWarning: ${newMissingComponents.length} parts not found in inventory` : ""}`
             )
           } else {
             setMissingBomComp(newMissingComponents)
             setHasUnappliedChanges(true)
             alert(
-              `BOM Loaded!\n\nProcessed ${BOMdata.length} parts from BOM.\n${newMissingComponents.length > 0 ? `\nWarning: ${newMissingComponents.length} parts not found in inventory` : ""}`
+              `BOM Loaded!\n\nProcessed ${usableRows.length} lines (${BOMdata.length} unique parts, ${totalBomQuantity} pcs).${skippedCount > 0 ? `\nSkipped ${skippedCount} lines with no LCSC part number.` : ""}${newMissingComponents.length > 0 ? `\n\nWarning: ${newMissingComponents.length} parts not found in inventory` : ""}`
             )
           }
 
