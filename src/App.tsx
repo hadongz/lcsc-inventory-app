@@ -41,6 +41,8 @@ type AggregatedRow = RowData & {
 
 const STORAGE_KEY = "lcsc-inventory-data"
 const FILENAME_KEY = "lcsc-inventory-filename"
+// Snapshot taken just before "Apply BOM", so the deduction can be undone.
+const BACKUP_KEY = "lcsc-inventory-backup"
 
 const MENU_ITEM = "block w-full px-4 py-2 text-left text-sm text-gray-200 hover:bg-gray-700"
 
@@ -56,7 +58,7 @@ export default function InventoryApp() {
   const [multiplier, setMultiplier] = useState<number>(1)
   const [saveIndicator, setSaveIndicator] = useState<string>("")
   const [hasUnappliedChanges, setHasUnappliedChanges] = useState<boolean>(false)
-  const [isModifiedFromStorage, setIsModifiedFromStorage] = useState<boolean>(false)
+  const [hasBackup, setHasBackup] = useState<boolean>(false)
 
   // "Add by LCSC ID" dialog
   const [showMenu, setShowMenu] = useState<boolean>(false)
@@ -118,6 +120,9 @@ export default function InventoryApp() {
         }
         console.log(`Loaded ${parsed.length} parts from localStorage`)
       }
+
+      // An undo snapshot survives reloads, so the button must come back too.
+      setHasBackup(localStorage.getItem(BACKUP_KEY) !== null)
     } catch (error) {
       console.error("Failed to load from localStorage:", error)
     } finally {
@@ -144,21 +149,40 @@ export default function InventoryApp() {
     if (window.confirm("Are you sure you want to clear all inventory data?")) {
       localStorage.removeItem(STORAGE_KEY)
       localStorage.removeItem(FILENAME_KEY)
+      localStorage.removeItem(BACKUP_KEY)
       setData([])
       setFileName("inventory.csv")
-      setIsModifiedFromStorage(false)
+      setHasBackup(false)
       alert("All data cleared")
     }
   }
 
-  const reloadOriginal = () => {
-    if (window.confirm("Reload original inventory from localStorage? Any applied changes will be lost.")) {
-      loadFromStorage()
-      setIsModifiedFromStorage(false)
+  // Restores the snapshot taken by the last "Apply BOM" and persists it, so
+  // undoing survives a reload the same way applying does.
+  const undoApply = () => {
+    const backup = localStorage.getItem(BACKUP_KEY)
+    if (!backup) {
+      alert("Nothing to undo — no BOM has been applied.")
+      return
+    }
+
+    if (!window.confirm("Undo the last Apply BOM? Quantities go back to what they were before it.")) {
+      return
+    }
+
+    try {
+      const restored: AggregatedRow[] = JSON.parse(backup)
+      setData(restored)
+      saveToStorage(restored)
+      localStorage.removeItem(BACKUP_KEY)
+      setHasBackup(false)
       setHasUnappliedChanges(false)
       setMissingBomComp([])
-      setSaveIndicator("Original Reloaded")
+      setSaveIndicator("Apply BOM Undone")
       setTimeout(() => setSaveIndicator(""), 2000)
+    } catch (error) {
+      console.error("Failed to restore backup:", error)
+      alert("Could not restore the backup.")
     }
   }
 
@@ -350,10 +374,7 @@ export default function InventoryApp() {
             )
           }
 
-          // Only save if we haven't applied changes (modified from storage)
-          if (!isModifiedFromStorage) {
-            saveToStorage(newData, newFileName)
-          }
+          saveToStorage(newData, newFileName)
         } else {
           const rows = results.data.map(transformRow)
           const aggregated = aggregateByLcscId(rows)
@@ -379,12 +400,12 @@ export default function InventoryApp() {
               }
             })
             setData(combined)
-            setIsModifiedFromStorage(false)
+            setHasBackup(false)
             saveToStorage(combined, newFileName)
             alert(`Combined successfully!\n\nAdded ${aggregated.length} parts.\nNew total: ${combined.length} unique parts.`)
           } else {
             setData(aggregated)
-            setIsModifiedFromStorage(false)
+            setHasBackup(false)
             saveToStorage(aggregated, newFileName)
             if (newFileName) setFileName(newFileName)
             alert(`Loaded successfully!\n\nImported ${rows.length} rows.\nAggregated to ${aggregated.length} unique parts.`)
@@ -443,11 +464,7 @@ export default function InventoryApp() {
     a.click()
     URL.revokeObjectURL(url)
 
-    if (isModifiedFromStorage) {
-      alert("Exported successfully!\n\nNote: Exported data includes applied BOM changes.\nOriginal inventory remains in localStorage.")
-    } else {
-      alert("Exported successfully!")
-    }
+    alert("Exported successfully!")
   }
 
   const openAddPart = () => {
@@ -542,7 +559,7 @@ export default function InventoryApp() {
     }
 
     setData(newData)
-    setIsModifiedFromStorage(false)
+    setHasBackup(false)
     saveToStorage(newData)
     setShowAddPart(false)
 
@@ -562,10 +579,7 @@ export default function InventoryApp() {
       setData(newData)
       setMissingBomComp([])
       setHasUnappliedChanges(false)
-
-      if (!isModifiedFromStorage) {
-        saveToStorage(newData)
-      }
+      saveToStorage(newData)
     }
   }
 
@@ -575,7 +589,10 @@ export default function InventoryApp() {
       return
     }
 
-    if (!window.confirm(`Apply BOM usage (×${multiplier})? This will subtract used quantities from the working copy.\n\nOriginal inventory remains safe in localStorage - reload page to restore.`)) {
+    const usedParts = data.filter((row) => (row.editedQuantity || 0) > 0)
+    const totalUsed = usedParts.reduce((sum, row) => sum + (row.editedQuantity || 0) * multiplier, 0)
+
+    if (!window.confirm(`Apply BOM usage (×${multiplier})?\n\nThis subtracts ${totalUsed} pcs across ${usedParts.length} parts from your inventory and saves it.\n\nUse "Undo Apply BOM" if you need to reverse it.`)) {
       return
     }
 
@@ -591,14 +608,24 @@ export default function InventoryApp() {
       return row
     })
 
+    // Snapshot the pre-apply state first, so the deduction stays reversible
+    // now that it is written straight to localStorage.
+    try {
+      localStorage.setItem(BACKUP_KEY, JSON.stringify(data))
+      setHasBackup(true)
+    } catch (error) {
+      console.error("Failed to store undo snapshot:", error)
+      setHasBackup(false)
+    }
+
     setData(newData)
     setMissingBomComp([])
     setHasUnappliedChanges(false)
-    setIsModifiedFromStorage(true)
-    setSaveIndicator("BOM Applied (Not Saved)")
+    saveToStorage(newData)
+    setSaveIndicator("BOM Applied & Saved")
     setTimeout(() => setSaveIndicator(""), 3000)
 
-    alert("BOM usage applied! Quantities updated in working copy.\n\nOriginal inventory is safe in localStorage.\nReload page to restore original.")
+    alert(`BOM applied and saved.\n\nSubtracted ${totalUsed} pcs across ${usedParts.length} parts.`)
   }
 
   const deleteRow = (lcscId: string) => {
@@ -610,10 +637,7 @@ export default function InventoryApp() {
 
     const newData = data.filter((d) => d.lcscId !== lcscId)
     setData(newData)
-
-    if (!isModifiedFromStorage) {
-      saveToStorage(newData)
-    }
+    saveToStorage(newData)
   }
 
   const handleQuantityChange = (index: number, value: string) => {
@@ -622,10 +646,7 @@ export default function InventoryApp() {
     newData[index].editedQuantity = numValue
     setData(newData)
     setHasUnappliedChanges(true)
-
-    if (!isModifiedFromStorage) {
-      saveToStorage(newData)
-    }
+    saveToStorage(newData)
   }
 
   const handleSort = (field: keyof RowData) => {
@@ -756,9 +777,9 @@ export default function InventoryApp() {
                   <p className="border-t border-gray-700 px-4 pt-3 pb-1 text-xs font-bold uppercase tracking-wide text-gray-400">
                     Data
                   </p>
-                  {isModifiedFromStorage && (
-                    <button onClick={() => runFromMenu(reloadOriginal)} className={MENU_ITEM}>
-                      Reload Original
+                  {hasBackup && (
+                    <button onClick={() => runFromMenu(undoApply)} className={MENU_ITEM}>
+                      Undo Apply BOM
                     </button>
                   )}
                   <button onClick={() => runFromMenu(clearStorage)} className={`${MENU_ITEM} text-red-400`}>
@@ -826,7 +847,7 @@ export default function InventoryApp() {
             </p>
             <div className="flex items-center gap-2">
               <p className="text-xs text-green-400 italic">
-                {isModifiedFromStorage ? "Viewing: Applied Changes (Original in localStorage)" : `Saved to localStorage: ${fileName}`}
+                {`Saved to localStorage: ${fileName}`}{hasBackup ? " · Apply BOM can be undone" : ""}
               </p>
               {saveIndicator && (
                 <span className="text-xs text-green-400 font-bold bg-green-900 px-2 py-1 rounded">
